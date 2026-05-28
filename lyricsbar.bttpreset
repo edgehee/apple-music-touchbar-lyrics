@@ -1,0 +1,19 @@
+{
+  "BTTPresetContent": [
+    {
+      "BTTTriggerType": 642,
+      "BTTTriggerClass": "BTTTriggerTypeTouchBar",
+      "BTTPredefinedActionType": -1,
+      "BTTEnabled": 1,
+      "BTTEnabled2": 1,
+      "BTTOrder": 0,
+      "BTTMergeIntoTouchBarGroup": false,
+      "BTTIconData": "",
+      "BTTActionGroup": [],
+      "BTTAdditionalConfiguration": "{\"BTTTouchBarButtonColor\":\"0, 0, 0, 200\",\"BTTTouchBarItemPlacement\":0,\"BTTTouchBarButtonWidth\":700,\"BTTTouchBarAlwaysShowButton\":false,\"BTTTouchBarButtonFontSize\":13,\"BTTTouchBarButtonTextAlignment\":0,\"BTTRefreshInterval\":0.5,\"BTTTouchBarShellScriptString\":\"cat \\/tmp\\/current_lyric.txt 2>\\/dev\\/null || echo '\\u266a'\",\"BTTTouchBarFreeSpaceAfterButton\":\"5.000000\",\"BTTTouchBarButtonName\":\"\\u266a Lyrics\"}",
+      "BTTTriggerName": "♪ Lyrics"
+    }
+  ],
+  "BTTVersion": "4.0",
+  "BTTPresetName": "LyricsBar"
+}
