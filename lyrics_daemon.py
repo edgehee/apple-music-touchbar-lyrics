@@ -43,7 +43,13 @@ BTT_WIDGET_UUID = "609EACFB-40DB-4AAB-904C-7B355C7237A9"
 _BTT_PUSH_SCRIPT = "/tmp/btt_push.applescript"
 # 표시 파이프라인 지연(위치읽기+push ≈ 0.46s) 보정용 미리보기 초.
 # 가사가 늦게 뜨면 늘리고, 너무 빨리 뜨면 줄이세요.
-LEAD_SECONDS = 0.2
+LEAD_SECONDS = 0.3         # 살짝 빠르게(가사가 노래보다 아주 조금 먼저)
+
+# ===== 효과 설정 (끄려면 False) =====
+KARAOKE = True             # 가사가 노래 진행에 맞춰 단어/글자별로 차오름 (발라드는 자동으로 끔)
+NOTE_ANIM = True           # 음표 아이콘 ♪♫♬♩ 애니메이션
+NOTE_SYMBOLS = ["♪", "♫", "♬", "♩"]
+NOTE_FRAMES = [f"/tmp/note_{i}.png" for i in range(len(NOTE_SYMBOLS))]
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -66,15 +72,20 @@ LYRIC_FONT_INDEX = 2            # 굵은 가중치 (0~ : 가는것→굵은것)
 
 
 def generate_note_icon(rgb: Tuple[int, int, int]):
-    """앨범색 ♪ 음표 PNG 생성 (폴백용)."""
+    """앨범색 음표 PNG들 생성.
+    NOTE_FRAMES[i] = 각 음표 심볼(♪♫♬♩, 살짝 크기 펄스), NOTE_ICON = 폴백용 기본."""
     try:
         from PIL import Image, ImageDraw, ImageFont
         r, g, b = rgb
-        img = Image.new("RGBA", (44, 44), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        font = ImageFont.truetype(FONT_PATH, 34)
-        d.text((6, 2), "♪", font=font, fill=(r, g, b, 255))
-        img.save(NOTE_ICON)
+        for i, sym in enumerate(NOTE_SYMBOLS):
+            size = 34 if i % 2 == 0 else 29   # 짝/홀 프레임 크기 차이로 펄스 느낌
+            font = ImageFont.truetype(FONT_PATH, size)
+            img = Image.new("RGBA", (44, 44), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.text((6, 2 + (34 - size) // 2), sym, font=font, fill=(r, g, b, 255))
+            img.save(NOTE_FRAMES[i])
+            if i == 0:
+                img.save(NOTE_ICON)  # 폴백 스크립트/기본용
     except Exception as e:
         logging.debug(f"generate_note_icon: {e}")
 
@@ -205,10 +216,10 @@ def resolve_widget_uuid() -> Optional[str]:
     return None
 
 
-def push_to_btt(text: str):
-    """가사 줄이 바뀌는 즉시 BTT 위젯에 직접 push (텍스트 + 앨범색 음표 아이콘)."""
+def push_to_btt(text: str, icon_path: str = NOTE_ICON):
+    """BTT 위젯에 직접 push (텍스트 + 지정한 음표 프레임 아이콘)."""
     safe = text.replace("\\", "\\\\").replace('"', '\\"')
-    icon = f' icon_path "{NOTE_ICON}"' if os.path.exists(NOTE_ICON) else ""
+    icon = f' icon_path "{icon_path}"' if icon_path and os.path.exists(icon_path) else ""
     script = (f'tell application "BetterTouchTool" to update_touch_bar_widget '
               f'"{BTT_WIDGET_UUID}" text "{safe}"{icon}')
     try:
@@ -219,7 +230,7 @@ def push_to_btt(text: str):
         logging.debug(f"push_to_btt: {e}")
 
 
-def write_files(text: str):
+def write_files(text: str, icon_path: str = NOTE_ICON):
     """가사 + 색상 파일 기록(폴백) + BTT 즉시 push."""
     try:
         with open(LYRIC_FILE, "w", encoding="utf-8") as f:
@@ -228,7 +239,7 @@ def write_files(text: str):
             f.write(_current_color)
     except Exception as e:
         logging.debug(f"write_files: {e}")
-    push_to_btt(text)
+    push_to_btt(text, icon_path)
 
 
 def get_music_state() -> Optional[dict]:
@@ -240,7 +251,8 @@ def get_music_state() -> Optional[dict]:
             set ar to artist of current track
             set al to album of current track
             set ps to (player state as string)
-            return (pos as string) & "|||" & t & "|||" & ar & "|||" & al & "|||" & ps
+            set gn to (genre of current track)
+            return (pos as string) & "|||" & t & "|||" & ar & "|||" & al & "|||" & ps & "|||" & gn
         else
             return "stopped"
         end if
@@ -256,8 +268,10 @@ def get_music_state() -> Optional[dict]:
         if len(parts) < 4:
             return None
         playing = (len(parts) >= 5 and "play" in parts[4].lower())
+        genre = parts[5] if len(parts) >= 6 else ""
         return {"position": float(parts[0]), "track": parts[1],
-                "artist": parts[2], "album": parts[3], "playing": playing}
+                "artist": parts[2], "album": parts[3],
+                "playing": playing, "genre": genre}
     except Exception as e:
         logging.warning(f"get_music_state: {e}")
         return None
@@ -307,23 +321,75 @@ def get_lyric_at(lines: List[Tuple[float, str]], position: float) -> str:
 # 이 시간(초) 이상 가사 없이 비는 구간(간주/인트로)에만 제목-아티스트 표시
 GAP_TITLE_THRESHOLD = 3.0
 
+# 발라드/잔잔한 장르 (Apple Music 장르 태그는 부정확해서 보조용으로만 사용)
+BALLAD_GENRES = ["발라드", "ballad", "어쿠스틱", "acoustic"]
 
-def get_display_at(lines: List[Tuple[float, str]], position: float):
+# 가사 밀도(초당 단어 수) 기준 — 이 값 이상이면 빠른 곡(카라오케), 미만이면 발라드(전체줄).
+# 장르 태그가 엉터리(발라드도 K-Pop으로 표기)라, 실제 가사 속도로 판단하는 게 더 정확함.
+FAST_WPS_THRESHOLD = 1.4
+
+
+def is_ballad(genre: str) -> bool:
+    g = (genre or "").lower()
+    return any(k in g for k in BALLAD_GENRES)
+
+
+def is_fast_song(lines: List[Tuple[float, str]]) -> bool:
+    """가사 밀도로 빠른 곡(랩/팝) 여부 판단. 정보 부족하면 True(기본 카라오케)."""
+    texts = [(ts, t) for ts, t in lines if t]
+    if len(texts) < 4:
+        return True
+    span = texts[-1][0] - texts[0][0]
+    if span <= 0:
+        return True
+    words = sum(len(t.split()) for _, t in texts)
+    return (words / span) >= FAST_WPS_THRESHOLD
+
+
+def song_wps(lines: List[Tuple[float, str]]) -> float:
+    """로그용 초당 단어 수."""
+    texts = [(ts, t) for ts, t in lines if t]
+    if len(texts) < 2:
+        return 0.0
+    span = texts[-1][0] - texts[0][0]
+    if span <= 0:
+        return 0.0
+    return sum(len(t.split()) for _, t in texts) / span
+
+
+def _karaoke_reveal(text: str, frac: float) -> str:
+    """진행률 frac(0~1)만큼 가사를 공개. 단어 단위(공백 있으면)·글자 단위(없으면)."""
+    frac = max(0.0, min(1.0, frac / 0.75))  # 줄 구간 앞 75%에서 다 공개되도록
+    words = text.split(" ")
+    if len(words) > 1:
+        n = max(1, int(round(len(words) * frac)))
+        return " ".join(words[:n])
+    # 공백 없는 한 덩어리 → 글자 단위로 공개
+    n = max(1, int(round(len(text) * frac)))
+    return text[:n]
+
+
+def get_display_at(lines: List[Tuple[float, str]], position: float, karaoke: bool = True):
     """현재 위치에 표시할 내용을 결정.
-    - 가사 줄이 진행 중   → 그 가사 텍스트
+    - 가사 줄이 진행 중   → 그 가사 텍스트 (karaoke면 진행률만큼 공개)
     - 짧은 쉼(3초 미만)   → "" (그냥 쉼, 음표만)
     - 긴 간주(3초 이상)   → None (호출측에서 제목-아티스트 표시)
     """
     if not lines:
         return None
-    cur_ts, cur_text = None, ""
-    for ts, text in lines:
+    cur_ts, cur_text, cur_idx = None, "", -1
+    for i, (ts, text) in enumerate(lines):
         if ts <= position:
-            cur_ts, cur_text = ts, text
+            cur_ts, cur_text, cur_idx = ts, text, i
         else:
             break
     if cur_text:
-        return cur_text  # 가사 줄 진행 중
+        if not karaoke:
+            return cur_text
+        # 이 줄의 시간 창(다음 줄 시작까지)에서 진행률 계산
+        next_ts = lines[cur_idx + 1][0] if cur_idx + 1 < len(lines) else cur_ts + 4.0
+        dur = max(0.4, next_ts - cur_ts)
+        return _karaoke_reveal(cur_text, (position - cur_ts) / dur)
     # 빈 줄(쉼) 구간 — 다음 '실제 가사'까지의 간격으로 길이 판단
     next_lyric_ts = None
     for ts, text in lines:
@@ -447,6 +513,8 @@ def main():
     last_resync = -999.0
     last_resolve = 0.0
     miss_count = 0          # Music 상태 읽기 연속 실패 횟수
+    last_frame = -1         # 마지막으로 push한 음표 애니메이션 프레임
+    use_karaoke = True      # 현재 곡의 카라오케 사용 여부 (장르 따라 결정)
 
     while True:
         now = time.monotonic()
@@ -490,8 +558,12 @@ def main():
                     # 가사를 먼저 받아 최대한 빨리 표시 (색 추출은 느리므로 뒤로)
                     lrc_text = fetch_lrc(new_state["artist"], new_state["track"], new_state["album"])
                     lrc_lines = parse_lrc(lrc_text) if lrc_text else []
+                    # 카라오케 on/off 결정: 명시적 발라드 장르거나 가사가 느리면(발라드) 전체줄
+                    genre = new_state.get("genre", "")
+                    use_karaoke = KARAOKE and not is_ballad(genre) and is_fast_song(lrc_lines)
                     _current_color = get_album_color()  # 음표 색 (가사보다 덜 급함)
-                    logging.info(f"색상 {_current_color}: {new_state['artist']} - {new_state['track']}")
+                    mode = "카라오케" if use_karaoke else "전체줄(발라드)"
+                    logging.info(f"{mode} (wps={song_wps(lrc_lines):.2f}, 장르'{genre}'): {new_state['artist']} - {new_state['track']}")
 
         if state is None:
             time.sleep(0.2)
@@ -502,19 +574,31 @@ def main():
 
         title_artist = truncate(f"{state['track']} - {state['artist']}", 80)
         if lrc_lines:
-            disp = get_display_at(lrc_lines, est_pos + LEAD_SECONDS)
+            disp = get_display_at(lrc_lines, est_pos + LEAD_SECONDS, use_karaoke)
             # disp 가사 → 가사 / "" → 짧은 쉼(음표만) / None → 긴 간주(제목-아티스트)
             text = title_artist if disp is None else truncate(disp)
         else:
             text = title_artist
 
-        if text != last_text:
+        # 음표 애니메이션: 재생 중일 때 ~0.4초마다 다음 프레임으로 순환
+        if NOTE_ANIM and playing:
+            frame = int(time.monotonic() / 0.4) % len(NOTE_FRAMES)
+        else:
+            frame = 0
+
+        # 텍스트가 바뀌거나 음표 프레임이 바뀌면 push
+        if text != last_text or frame != last_frame:
             last_text = text
-            write_files(text)
+            last_frame = frame
+            # 폴백 스크립트(0.5s 폴링)도 같은 프레임을 보도록 NOTE_ICON 동기화
+            try:
+                with open(NOTE_FRAMES[frame], "rb") as src, open(NOTE_ICON, "wb") as dst:
+                    dst.write(src.read())
+            except Exception:
+                pass
+            write_files(text, NOTE_FRAMES[frame])
 
         time.sleep(0.08)
-
-        time.sleep(0.1)
 
 
 if __name__ == "__main__":
