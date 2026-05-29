@@ -248,7 +248,7 @@ def get_music_state() -> Optional[dict]:
     """
     try:
         r = subprocess.run(["osascript", "-e", script],
-                           capture_output=True, text=True, timeout=4)
+                           capture_output=True, text=True, timeout=6)
         raw = r.stdout.strip()
         if raw == "stopped" or not raw:
             return None
@@ -446,6 +446,7 @@ def main():
     playing = False
     last_resync = -999.0
     last_resolve = 0.0
+    miss_count = 0          # Music 상태 읽기 연속 실패 횟수
 
     while True:
         now = time.monotonic()
@@ -461,28 +462,36 @@ def main():
             new_state = get_music_state()
             last_resync = time.monotonic()
             if new_state is None:
-                if state is not None:
+                # 시스템이 바쁘면 osascript가 일시적으로 실패할 수 있음.
+                # 한두 번 실패로 가사를 지우지 말고, 연속 3회(약 3초) 실패해야 '정지'로 간주.
+                miss_count += 1
+                if miss_count >= 3 and state is not None:
                     write_files("")
                     state = None
                     current_track_id = None
                     lrc_lines = []
                     last_text = None
-                time.sleep(0.3)
-                continue
-            state = new_state
-            base_pos = new_state["position"]
-            base_mono = call_start  # 위치 읽기 시작 시점 기준으로 보간
-            playing = new_state["playing"]
+                # 일시적 실패면 기존 상태 유지 → 아래 표시 로직이 보간으로 계속 진행
+            else:
+                miss_count = 0
+                state = new_state
+                base_pos = new_state["position"]
+                base_mono = call_start  # 위치 읽기 시작 시점 기준으로 보간
+                playing = new_state["playing"]
 
-            track_id = f"{new_state['artist']}|||{new_state['track']}"
-            if track_id != current_track_id:
-                current_track_id = track_id
-                last_text = None
-                _current_color = get_album_color()
-                logging.info(f"색상 {_current_color}: {new_state['artist']} - {new_state['track']}")
-                write_files("")
-                lrc_text = fetch_lrc(new_state["artist"], new_state["track"], new_state["album"])
-                lrc_lines = parse_lrc(lrc_text) if lrc_text else []
+                track_id = f"{new_state['artist']}|||{new_state['track']}"
+                if track_id != current_track_id:
+                    current_track_id = track_id
+                    last_text = None
+                    lrc_lines = []
+                    # 곡이 바뀌면 빈 화면 대신 즉시 제목-아티스트를 띄움
+                    # (가사 받아오는 동안 터치바가 비지 않게)
+                    write_files(truncate(f"{new_state['track']} - {new_state['artist']}", 80))
+                    # 가사를 먼저 받아 최대한 빨리 표시 (색 추출은 느리므로 뒤로)
+                    lrc_text = fetch_lrc(new_state["artist"], new_state["track"], new_state["album"])
+                    lrc_lines = parse_lrc(lrc_text) if lrc_text else []
+                    _current_color = get_album_color()  # 음표 색 (가사보다 덜 급함)
+                    logging.info(f"색상 {_current_color}: {new_state['artist']} - {new_state['track']}")
 
         if state is None:
             time.sleep(0.2)
