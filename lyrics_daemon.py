@@ -783,6 +783,8 @@ def main():
     has_thumb = False       # 현재 곡 앨범 썸네일 생성 성공 여부
     last_burst = False      # 직전 루프의 탭 버스트 상태
     loaded_token = None     # 백그라운드 로딩 결과가 적용된 곡 토큰
+    scrubber_mode = False   # 더블탭 토글: 가사 대신 스크러버만 표시
+    last_tap_mtime = 0.0    # 마지막으로 본 탭 파일 시각(더블탭 감지용)
 
     while True:
         now = time.monotonic()
@@ -851,6 +853,22 @@ def main():
         pos_lead = est_pos + LEAD_SECONDS
         dur = state.get("duration", 0.0)
 
+        # 탭 감지: 불꽃(버스트) + 더블탭으로 스크러버 모드 토글
+        tap_burst = False
+        tap_age = 999.0
+        if TAP_EFFECT:
+            try:
+                if os.path.exists(TAP_FILE):
+                    tm = os.path.getmtime(TAP_FILE)
+                    tap_age = time.time() - tm
+                    tap_burst = tap_age < TAP_BURST_SECS
+                    if tm > last_tap_mtime:           # 새 탭 발생
+                        if last_tap_mtime and (tm - last_tap_mtime) < 0.45:
+                            scrubber_mode = not scrubber_mode  # 빠른 두 번 탭 → 토글
+                        last_tap_mtime = tm
+            except Exception:
+                pass
+
         def interlude_text():
             """긴 간주/무가사 구간: 가사 임박하면 카운트다운, 아니면 제목+진행바."""
             nxt = get_next_lyric_ts(lrc_lines, pos_lead) if lrc_lines else None
@@ -860,23 +878,15 @@ def main():
                 return truncate(title_artist + "   " + make_progress_bar(est_pos, dur), 120)
             return title_artist
 
-        if lrc_lines:
+        if scrubber_mode:
+            # 더블탭 모드: 가사 숨기고 앨범+스크러버만
+            text = make_progress_bar(est_pos, dur) if dur > 0 else title_artist
+        elif lrc_lines:
             disp = get_display_at(lrc_lines, pos_lead, use_karaoke)
             # disp 가사 → 가사 / "" → 짧은 쉼(음표만) / None → 긴 간주
             text = interlude_text() if disp is None else truncate(disp)
         else:
             text = interlude_text()
-
-        # 탭 임팩트: 탭하면(/tmp/lyric_tap 갱신) 아이콘 자리에 불꽃 폭발 애니메이션.
-        tap_burst = False
-        tap_age = 999.0
-        if TAP_EFFECT:
-            try:
-                if os.path.exists(TAP_FILE):
-                    tap_age = time.time() - os.path.getmtime(TAP_FILE)
-                    tap_burst = tap_age < TAP_BURST_SECS
-            except Exception:
-                pass
 
         # 아이콘 결정: 탭 버스트 중이면 불꽃 프레임, 아니면 앨범썸네일/음표
         if tap_burst:
