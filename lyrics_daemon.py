@@ -26,6 +26,10 @@ NOTE_ICON = "/tmp/note_icon.png"
 ART_FILE = "/tmp/album_art_btt.jpg"
 LOG_FILE = "/tmp/lyricsbar.log"
 FONT_PATH = "/System/Library/Fonts/Apple Symbols.ttf"
+# 위젯 이름(BTT UI에서 이 이름으로 만들면 데몬이 자동으로 UUID를 찾아 연결).
+# BTT가 초기화돼도 같은 이름으로 위젯만 다시 만들면 코드 수정 없이 복구됨.
+BTT_WIDGET_NAME = "Lyrics"
+# 자동 탐색 실패 시 폴백으로 쓰는 마지막으로 알려진 UUID.
 BTT_WIDGET_UUID = "609EACFB-40DB-4AAB-904C-7B355C7237A9"
 _BTT_PUSH_SCRIPT = "/tmp/btt_push.applescript"
 # 표시 파이프라인 지연(위치읽기+push ≈ 0.46s) 보정용 미리보기 초.
@@ -152,6 +156,44 @@ def get_album_color() -> str:
         _current_rgb = default
         generate_note_icon(default)
         return "230,230,230,255"
+
+
+def resolve_widget_uuid() -> Optional[str]:
+    """BTT에 등록된 트리거 중 BTT_WIDGET_NAME 위젯을 찾아 UUID 반환.
+    BTT가 초기화돼 위젯을 다시 만들어도(같은 이름) 코드 수정 없이 연결됨."""
+    global BTT_WIDGET_UUID
+    script = 'tell application "BetterTouchTool" to get_triggers'
+    try:
+        r = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=6)
+        data = json.loads(r.stdout)
+    except Exception as e:
+        logging.warning(f"resolve_widget_uuid: {e}")
+        return None
+    if not isinstance(data, list):
+        return None
+    name_l = BTT_WIDGET_NAME.lower()
+    fallback = None
+    for t in data:
+        if not isinstance(t, dict):
+            continue
+        uuid = t.get("BTTUUID")
+        if not uuid:
+            continue
+        # 쉘 스크립트 위젯(642) 우선, 이름이 일치하면 즉시 채택
+        nm = (t.get("BTTWidgetName") or t.get("BTTTriggerName") or "").lower()
+        if name_l in nm:
+            if t.get("BTTTriggerType") == 642:
+                BTT_WIDGET_UUID = uuid
+                logging.info(f"위젯 UUID 자동탐색 성공: {uuid} ({t.get('BTTWidgetName')})")
+                return uuid
+            fallback = fallback or uuid
+    if fallback:
+        BTT_WIDGET_UUID = fallback
+        logging.info(f"위젯 UUID(이름매칭, 타입미확인): {fallback}")
+        return fallback
+    logging.warning(f"'{BTT_WIDGET_NAME}' 위젯을 BTT에서 못 찾음 — 폴백 UUID 사용")
+    return None
 
 
 def push_to_btt(text: str):
@@ -319,10 +361,17 @@ def main():
 
     _current_color = "230,230,230,255"
     generate_note_icon((230, 230, 230))
+    resolve_widget_uuid()  # 시작 시 위젯 UUID 자동 탐색
     write_files("")
     logging.info("lyrics_daemon started")
 
+    loops = 0
     while True:
+        # 위젯이 아직 없거나 재생성된 경우 대비해 주기적으로(약 30초) 재탐색
+        loops += 1
+        if loops % 300 == 0:
+            resolve_widget_uuid()
+
         state = get_music_state()
 
         if state is None:
