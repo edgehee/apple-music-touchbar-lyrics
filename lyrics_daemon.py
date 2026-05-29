@@ -17,7 +17,16 @@ import time
 import sys
 import logging
 import colorsys
+import ssl
 from typing import Optional, List, Tuple
+
+# Homebrew python은 시스템 CA가 없어 lrclib SSL 인증이 실패할 수 있음.
+# certifi 인증서로 검증 컨텍스트를 만들어 모든 https 요청에 사용 (없으면 기본값).
+try:
+    import certifi
+    _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+except Exception:
+    _SSL_CTX = None
 
 CACHE_DIR = os.path.expanduser("~/lyrics_bar/cache")
 LYRIC_FILE = "/tmp/current_lyric.txt"
@@ -345,7 +354,7 @@ def _lrclib(url: str, expected_artist: Optional[str] = None) -> Optional[str]:
     """expected_artist 주어지면 검색 결과 중 아티스트 일치하는 것만 채택."""
     try:
         req = urllib.request.Request(url, headers={"Lrclib-Client": "LyricsBar/1.0"})
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with urllib.request.urlopen(req, timeout=6, context=_SSL_CTX) as resp:
             data = json.loads(resp.read())
         if isinstance(data, list):
             for item in data:
