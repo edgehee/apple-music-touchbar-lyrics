@@ -357,9 +357,13 @@ def song_wps(lines: List[Tuple[float, str]]) -> float:
     return sum(len(t.split()) for _, t in texts) / span
 
 
+# 카라오케가 줄 구간의 이 비율 지점에서 다 채워짐 (클수록 천천히/노래에 맞게, 작을수록 빠르게)
+KARAOKE_REVEAL_FRACTION = 0.77
+
+
 def _karaoke_reveal(text: str, frac: float) -> str:
     """진행률 frac(0~1)만큼 가사를 공개. 단어 단위(공백 있으면)·글자 단위(없으면)."""
-    frac = max(0.0, min(1.0, frac / 0.75))  # 줄 구간 앞 75%에서 다 공개되도록
+    frac = max(0.0, min(1.0, frac / KARAOKE_REVEAL_FRACTION))
     words = text.split(" ")
     if len(words) > 1:
         n = max(1, int(round(len(words) * frac)))
