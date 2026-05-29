@@ -34,7 +34,7 @@ BTT_WIDGET_UUID = "609EACFB-40DB-4AAB-904C-7B355C7237A9"
 _BTT_PUSH_SCRIPT = "/tmp/btt_push.applescript"
 # 표시 파이프라인 지연(위치읽기+push ≈ 0.46s) 보정용 미리보기 초.
 # 가사가 늦게 뜨면 늘리고, 너무 빨리 뜨면 줄이세요.
-LEAD_SECONDS = 0.5
+LEAD_SECONDS = 0.2
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -230,7 +230,8 @@ def get_music_state() -> Optional[dict]:
             set t to name of current track
             set ar to artist of current track
             set al to album of current track
-            return (pos as string) & "|||" & t & "|||" & ar & "|||" & al
+            set ps to (player state as string)
+            return (pos as string) & "|||" & t & "|||" & ar & "|||" & al & "|||" & ps
         else
             return "stopped"
         end if
@@ -245,11 +246,30 @@ def get_music_state() -> Optional[dict]:
         parts = raw.split("|||")
         if len(parts) < 4:
             return None
+        playing = (len(parts) >= 5 and "play" in parts[4].lower())
         return {"position": float(parts[0]), "track": parts[1],
-                "artist": parts[2], "album": parts[3]}
+                "artist": parts[2], "album": parts[3], "playing": playing}
     except Exception as e:
         logging.warning(f"get_music_state: {e}")
         return None
+
+
+# 가사가 아니라 제작진 크레딧인 줄 (作词:/作曲:/编曲:/작사:/Produced by: 등)
+_CREDIT_RE = re.compile(
+    r"^\s*("
+    r"作\s*词|作\s*詞|作\s*曲|编\s*曲|編\s*曲|制\s*作|製\s*作|监\s*制|監\s*製|"
+    r"混\s*音|母\s*带|录\s*音|錄\s*音|和\s*声|和\s*聲|出\s*品|发\s*行|發\s*行|"
+    r"작사|작곡|편곡|프로듀[서스]|"
+    r"lyrics?|composed?|composer|arrang(?:e|ed|er)|produced?|producer|"
+    r"mix(?:ed|ing)?|master(?:ed|ing)?|written|music|vocals?|guitars?|"
+    r"bass|drums?|piano|engineer"
+    r")\b.*[:：]",
+    re.IGNORECASE,
+)
+
+
+def _is_credit(text: str) -> bool:
+    return bool(text) and bool(_CREDIT_RE.match(text))
 
 
 def parse_lrc(lrc_text: str) -> List[Tuple[float, str]]:
@@ -258,7 +278,10 @@ def parse_lrc(lrc_text: str) -> List[Tuple[float, str]]:
         m = re.match(r"\[(\d+):(\d+(?:\.\d+)?)\](.*)", line)
         if m:
             ts = int(m.group(1)) * 60 + float(m.group(2))
-            lines.append((ts, m.group(3).strip()))
+            txt = m.group(3).strip()
+            if _is_credit(txt):
+                continue  # 제작진 크레딧 줄은 가사로 표시하지 않음
+            lines.append((ts, txt))
     return sorted(lines, key=lambda x: x[0])
 
 
@@ -270,6 +293,39 @@ def get_lyric_at(lines: List[Tuple[float, str]], position: float) -> str:
         else:
             break
     return current
+
+
+# 이 시간(초) 이상 가사 없이 비는 구간(간주/인트로)에만 제목-아티스트 표시
+GAP_TITLE_THRESHOLD = 3.0
+
+
+def get_display_at(lines: List[Tuple[float, str]], position: float):
+    """현재 위치에 표시할 내용을 결정.
+    - 가사 줄이 진행 중   → 그 가사 텍스트
+    - 짧은 쉼(3초 미만)   → "" (그냥 쉼, 음표만)
+    - 긴 간주(3초 이상)   → None (호출측에서 제목-아티스트 표시)
+    """
+    if not lines:
+        return None
+    cur_ts, cur_text = None, ""
+    for ts, text in lines:
+        if ts <= position:
+            cur_ts, cur_text = ts, text
+        else:
+            break
+    if cur_text:
+        return cur_text  # 가사 줄 진행 중
+    # 빈 줄(쉼) 구간 — 다음 '실제 가사'까지의 간격으로 길이 판단
+    next_lyric_ts = None
+    for ts, text in lines:
+        if ts > position and text:
+            next_lyric_ts = ts
+            break
+    if next_lyric_ts is None:
+        return None  # 곡 끝/아웃트로 → 제목-아티스트
+    gap_start = cur_ts if cur_ts is not None else 0.0
+    gap_len = next_lyric_ts - gap_start
+    return None if gap_len >= GAP_TITLE_THRESHOLD else ""
 
 
 def _norm(s: str) -> set:
@@ -309,13 +365,21 @@ def _lrclib(url: str, expected_artist: Optional[str] = None) -> Optional[str]:
         return None
 
 
+_no_lyrics_session = set()  # 이번 실행에서 가사 못 찾은 곡 (디스크엔 안 남김 → 재시작 시 재시도)
+
+
 def fetch_lrc(artist: str, track: str, album: str) -> Optional[str]:
     cache_key = re.sub(r"[^\w\-]", "_", f"{artist}_{track}")[:100]
     cache_file = os.path.join(CACHE_DIR, f"{cache_key}.lrc")
+    if cache_key in _no_lyrics_session:
+        return None
     if os.path.exists(cache_file):
         with open(cache_file, "r", encoding="utf-8") as f:
             c = f.read()
-        return c if c != "NO_LYRICS" else None
+        if c == "NO_LYRICS":
+            os.remove(cache_file)  # 예전 영구 실패 캐시 정리 → 아래서 재시도
+        else:
+            return c
 
     logging.info(f"Fetching lyrics: {artist} - {track}")
     synced = _lrclib("https://lrclib.net/api/get?" + urllib.parse.urlencode(
@@ -343,8 +407,7 @@ def fetch_lrc(artist: str, track: str, album: str) -> Optional[str]:
             f.write(synced)
         logging.info(f"Cached: {artist} - {track}")
         return synced
-    with open(cache_file, "w") as f:
-        f.write("NO_LYRICS")
+    _no_lyrics_session.add(cache_key)  # 디스크 영구 캐싱 안 함 → 재시작 시 재시도
     logging.info(f"No synced lyrics: {artist} - {track}")
     return None
 
@@ -365,45 +428,73 @@ def main():
     write_files("")
     logging.info("lyrics_daemon started")
 
-    loops = 0
-    while True:
-        # 위젯이 아직 없거나 재생성된 경우 대비해 주기적으로(약 30초) 재탐색
-        loops += 1
-        if loops % 300 == 0:
-            resolve_widget_uuid()
+    # 느린 osascript 위치 읽기는 RESYNC_INTERVAL마다 한 번만.
+    # 그 사이는 내부 단조시계(monotonic)로 위치를 보간해 부드럽게 추적.
+    RESYNC_INTERVAL = 1.0
+    state = None
+    base_pos = 0.0          # 마지막으로 읽은 실제 재생 위치
+    base_mono = 0.0         # 그 위치를 읽기 직전의 monotonic 시각
+    playing = False
+    last_resync = -999.0
+    last_resolve = 0.0
 
-        state = get_music_state()
+    while True:
+        now = time.monotonic()
+
+        # --- 30초마다 위젯 UUID 재탐색 ---
+        if now - last_resolve >= 30.0:
+            resolve_widget_uuid()
+            last_resolve = now
+
+        # --- 1초마다 실제 위치/곡 정보 재동기화 (느린 호출) ---
+        if now - last_resync >= RESYNC_INTERVAL:
+            call_start = time.monotonic()
+            new_state = get_music_state()
+            last_resync = time.monotonic()
+            if new_state is None:
+                if state is not None:
+                    write_files("")
+                    state = None
+                    current_track_id = None
+                    lrc_lines = []
+                    last_text = None
+                time.sleep(0.3)
+                continue
+            state = new_state
+            base_pos = new_state["position"]
+            base_mono = call_start  # 위치 읽기 시작 시점 기준으로 보간
+            playing = new_state["playing"]
+
+            track_id = f"{new_state['artist']}|||{new_state['track']}"
+            if track_id != current_track_id:
+                current_track_id = track_id
+                last_text = None
+                _current_color = get_album_color()
+                logging.info(f"색상 {_current_color}: {new_state['artist']} - {new_state['track']}")
+                write_files("")
+                lrc_text = fetch_lrc(new_state["artist"], new_state["track"], new_state["album"])
+                lrc_lines = parse_lrc(lrc_text) if lrc_text else []
 
         if state is None:
-            if current_track_id is not None:
-                write_files("")
-                current_track_id = None
-                lrc_lines = []
-                last_text = None
-            time.sleep(0.5)
+            time.sleep(0.2)
             continue
 
-        track_id = f"{state['artist']}|||{state['track']}"
-        if track_id != current_track_id:
-            current_track_id = track_id
-            last_text = None
-            _current_color = get_album_color()
-            logging.info(f"색상 {_current_color}: {state['artist']} - {state['track']}")
-            write_files("")
-            lrc_text = fetch_lrc(state["artist"], state["track"], state["album"])
-            lrc_lines = parse_lrc(lrc_text) if lrc_text else []
+        # --- 보간된 현재 위치 (재생 중일 때만 시간 흐름 반영) ---
+        est_pos = base_pos + ((time.monotonic() - base_mono) if playing else 0.0)
 
         title_artist = truncate(f"{state['track']} - {state['artist']}", 80)
         if lrc_lines:
-            lyric = get_lyric_at(lrc_lines, state["position"] + LEAD_SECONDS)
-            # 가사 줄이 있으면 가사, 간주/인트로(빈 줄)면 제목-아티스트
-            text = truncate(lyric) if lyric else title_artist
+            disp = get_display_at(lrc_lines, est_pos + LEAD_SECONDS)
+            # disp 가사 → 가사 / "" → 짧은 쉼(음표만) / None → 긴 간주(제목-아티스트)
+            text = title_artist if disp is None else truncate(disp)
         else:
             text = title_artist
 
         if text != last_text:
             last_text = text
             write_files(text)
+
+        time.sleep(0.08)
 
         time.sleep(0.1)
 
