@@ -606,6 +606,36 @@ def _lrclib(url: str, expected_artist: Optional[str] = None) -> Optional[str]:
 _no_lyrics_session = set()  # 이번 실행에서 가사 못 찾은 곡 (디스크엔 안 남김 → 재시작 시 재시도)
 
 
+def _lrclib_en_artist(track: str, artist: str) -> Optional[str]:
+    """lrclib 검색으로 영어 아티스트명을 알아냄 (한글 아티스트 뉴진스→NewJeans).
+    단어별 가사는 영어명으로만 있는 경우가 많음. 곡명은 원래 것을 그대로 쓰므로 아티스트만 추출."""
+    try:
+        url = "https://lrclib.net/api/search?" + urllib.parse.urlencode({"q": f"{track} {artist}"})
+        req = urllib.request.Request(url, headers={"Lrclib-Client": "LyricsBar/1.0"})
+        with urllib.request.urlopen(req, timeout=6, context=_SSL_CTX) as resp:
+            data = json.loads(resp.read())
+        for item in data:
+            if _artist_ok(item.get("artistName", ""), artist):
+                en_a = re.sub(r"\(.*?\)", "", item.get("artistName", "")).strip()
+                if en_a:
+                    return en_a
+    except Exception as e:
+        logging.debug(f"_lrclib_en_artist: {e}")
+    return None
+
+
+def _try_enhanced(query: str) -> Optional[str]:
+    """syncedlyrics enhanced 검색 → 단어 태그가 있을 때만 반환."""
+    try:
+        import syncedlyrics
+        r = syncedlyrics.search(query, enhanced=True)
+        if r and _WORD_TAG_RE.search(r):
+            return r
+    except Exception as e:
+        logging.debug(f"_try_enhanced: {e}")
+    return None
+
+
 def fetch_lrc(artist: str, track: str, album: str) -> Optional[str]:
     cache_key = re.sub(r"[^\w\-]", "_", f"{artist}_{track}")[:100]
     cache_file = os.path.join(CACHE_DIR, f"{cache_key}.lrc")
@@ -621,15 +651,16 @@ def fetch_lrc(artist: str, track: str, album: str) -> Optional[str]:
 
     logging.info(f"Fetching lyrics: {artist} - {track}")
     # 0) 단어별(enhanced) 가사 우선 — 진짜 박자 동기화. 단어 태그가 있을 때만 채택.
-    synced = None
-    try:
-        import syncedlyrics
-        enh = syncedlyrics.search(f"{artist} {track}", enhanced=True)
-        if enh and _WORD_TAG_RE.search(enh):
-            synced = enh
-            logging.info(f"단어별(enhanced) 가사 사용: {artist} - {track}")
-    except Exception as e:
-        logging.debug(f"enhanced: {e}")
+    synced = _try_enhanced(f"{artist} {track}")
+    if synced:
+        logging.info(f"단어별(enhanced) 가사 사용: {artist} - {track}")
+    if not synced:
+        # 한글 아티스트면 lrclib에서 영어명 얻어 단어별 재검색 (뉴진스→NewJeans). 곡명은 원래 것 유지.
+        en_a = _lrclib_en_artist(track, artist)
+        if en_a and en_a.lower() not in artist.lower():
+            synced = _try_enhanced(f"{en_a} {track}")
+            if synced:
+                logging.info(f"단어별(영어명) 가사 사용: {en_a} - {track}")
     if not synced:
         synced = _lrclib("https://lrclib.net/api/get?" + urllib.parse.urlencode(
             {"artist_name": artist, "track_name": track, "album_name": album}))
@@ -665,7 +696,7 @@ def truncate(text: str, n: int = 120) -> str:
     return text if len(text) <= n else text[:n - 1] + "…"
 
 
-PROGRESS_KNOB = "●"   # 스크러버 손잡이 (♡ ◆ 등으로 바꿔도 됨)
+PROGRESS_KNOB = "◦"   # 스크러버 손잡이 (● ♡ ◆ 등으로 바꿔도 됨)
 
 
 def _fmt_time(t: float) -> str:
@@ -680,8 +711,9 @@ def make_progress_bar(pos: float, dur: float, cells: int = 11) -> str:
         return ""
     frac = max(0.0, min(1.0, pos / dur))
     k = int(round(frac * (cells - 1)))
-    track = "━" * k + PROGRESS_KNOB + "─" * (cells - 1 - k)
-    return f"{_fmt_time(pos)} {track} {_fmt_time(dur)}"
+    track = "─" * k + PROGRESS_KNOB + "─" * (cells - 1 - k)
+    # 오른쪽은 남은 시간(-) 표시 (음악앱 스타일): 1:07 ──◦──── -4:05
+    return f"{_fmt_time(pos)} {track} -{_fmt_time(dur - pos)}"
 
 
 def get_next_lyric_ts(lines, position: float) -> Optional[float]:
