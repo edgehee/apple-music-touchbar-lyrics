@@ -2,3 +2,26 @@
 cache/
 __pycache__/
 *.pyc
+
+# macOS 시스템 파일
+.DS_Store
+
+# 런타임 상태 파일
+.font
+.window_pos
+tmp/
+
+# 같은 폴더에 있는 다른 프로젝트 파일 (이 저장소엔 포함 안 함)
+font_picker.py
+lyrics_overlay.py
+lyrics_web.py
+lyrics_window.py
+musicviz_daemon.py
+musicviz_menubar.sh
+sysmon_daemon.py
+sysmon_float.sh
+sysmon_widget.sh
+ipad_icons/
+ipad_walls/
+ipad_widgets/
+ipad_mockup.png

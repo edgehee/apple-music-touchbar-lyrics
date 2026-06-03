@@ -37,6 +37,11 @@ GLOW_FILE = "/tmp/glow_color.txt"   # 탭 시 쓸 밝은 네온 톤(앨범색을
 NOTE_ICON = "/tmp/note_icon.png"
 ART_FILE = "/tmp/album_art_btt.jpg"
 LOG_FILE = "/tmp/lyricsbar.log"
+# 화면 가사창(lyrics_window.py)용 출력:
+#  LINES_FILE: 곡이 바뀔 때 1회 — 전체 가사 줄(+단어 타이밍)·색·제목.
+#  POS_FILE:   ~0.2초마다 — 현재 재생위치/재생여부/샘플시각/곡ID (창이 보간해서 부드럽게).
+LINES_FILE = "/tmp/lyrics_lines.json"
+POS_FILE = "/tmp/lyrics_pos.txt"
 FONT_PATH = "/System/Library/Fonts/Apple Symbols.ttf"
 # 위젯 이름(BTT UI에서 이 이름으로 만들면 데몬이 자동으로 UUID를 찾아 연결).
 # BTT가 초기화돼도 같은 이름으로 위젯만 다시 만들면 코드 수정 없이 복구됨.
@@ -571,12 +576,85 @@ def _norm(s: str) -> set:
     return set(re.findall(r"[a-z0-9가-힣]+", (s or "").lower()))
 
 
+# 한글 아티스트명 ↔ lrclib 영문명 매핑 (lrclib은 영문명으로 저장된 경우가 많음).
+# 필요하면 계속 추가하세요.
+ARTIST_EN = {
+    "아이유": "IU", "방탄소년단": "BTS", "블랙핑크": "BLACKPINK", "뉴진스": "NewJeans",
+    "세븐틴": "SEVENTEEN", "트와이스": "TWICE", "에스파": "aespa", "르세라핌": "LE SSERAFIM",
+    "아이브": "IVE", "여자아이들": "I-DLE", "스트레이키즈": "Stray Kids", "엑소": "EXO",
+    "레드벨벳": "Red Velvet", "빅뱅": "BIGBANG", "하이키": "H1-KEY", "코르티스": "CORTIS",
+    "데이식스": "DAY6", "투모로우바이투게더": "TXT", "샤이니": "SHINee", "태연": "TAEYEON",
+    "지드래곤": "G-DRAGON", "악동뮤지션": "AKMU", "백예린": "Yerin Baek", "폴킴": "Paul Kim",
+    # BTS 솔로
+    "지민": "Jimin", "정국": "Jung Kook", "뷔": "V", "슈가": "SUGA", "어거스트디": "Agust D",
+    "제이홉": "j-hope", "진": "Jin", "알엠": "RM", "남준": "RM",
+    # BLACKPINK 솔로 + 기타 솔로
+    "지수": "JISOO", "제니": "JENNIE", "로제": "ROSÉ", "리사": "LISA",
+    "화사": "Hwasa", "청하": "CHUNG HA", "비비": "BIBI", "선미": "SUNMI",
+    "헤이즈": "Heize", "백현": "BAEKHYUN", "카이": "KAI", "도경수": "DOH KYUNG SOO",
+    "임영웅": "Lim Young Woong", "아이엠": "I.M", "박재범": "Jay Park", "크러쉬": "Crush",
+    "딘": "DEAN", "george": "George", "죠지": "George", "기리보이": "Giriboy",
+}
+
+
+def _expand_artist(expected: str) -> set:
+    """기대 아티스트 토큰 + 한글→영문 매핑까지 포함해 비교 폭을 넓힘(아이유→IU)."""
+    toks = _norm(expected)
+    e = expected or ""
+    for ko, en in ARTIST_EN.items():
+        if ko in e:
+            toks |= _norm(en)
+    return toks
+
+
 def _artist_ok(result_artist: str, expected: str) -> bool:
-    """검색 결과 아티스트가 기대 아티스트와 충분히 겹치는지 확인."""
-    a, b = _norm(result_artist), _norm(expected)
+    """검색 결과 아티스트가 기대 아티스트와 충분히 겹치는지 확인(한↔영 매핑 포함)."""
+    a, b = _norm(result_artist), _expand_artist(expected)
     if not a or not b:
         return False
     return len(a & b) > 0  # 토큰 하나라도 겹치면 동일 아티스트로 인정
+
+
+def _norm_title(s: str) -> str:
+    """제목 비교용 정규화: 괄호 안 내용 제거 + 영숫자/한글만 남김(공백·기호 제거)."""
+    s = re.sub(r"[\(\[][^\)\]]*[\)\]]", "", s or "")
+    return re.sub(r"[^a-z0-9가-힣]", "", s.lower())
+
+
+def _title_ok(result_title: str, want: str) -> bool:
+    """제목이 충분히 일치하는지(한↔영 아티스트명이 달라도 곡을 식별하기 위함)."""
+    a, b = _norm_title(result_title), _norm_title(want)
+    if not a or not b or len(b) < 2:
+        return False
+    return a == b or a in b or b in a
+
+
+def _lrclib_by_title(track: str, artist: str) -> Optional[str]:
+    """제목으로 검색해, 아티스트가 겹치거나(우선) 제목이 일치하는 첫 동기화 가사를 채택.
+    한글 아티스트(아이유)와 lrclib 영문명(IU)이 달라 아티스트 매칭이 실패하는 곡 구제용."""
+    try:
+        url = "https://lrclib.net/api/search?" + urllib.parse.urlencode({"q": track})
+        req = urllib.request.Request(url, headers={"Lrclib-Client": "LyricsBar/1.0"})
+        with urllib.request.urlopen(req, timeout=6, context=_SSL_CTX) as resp:
+            data = json.loads(resp.read())
+        if not isinstance(data, list):
+            return None
+        # 제목이 일치하고 동기화 가사가 있는 후보만 추림
+        cands = [it for it in data
+                 if (it.get("syncedLyrics") or "").strip()
+                 and _title_ok(it.get("trackName", ""), track)]
+        # 1순위: 아티스트도 겹치는 결과(한↔영 매핑 포함)
+        for it in cands:
+            if _artist_ok(it.get("artistName", ""), artist):
+                return it["syncedLyrics"]
+        # 2순위: 제목 후보들의 아티스트가 '모두 동일'할 때만 채택(애매하면 포기 → 엉뚱한 곡 방지)
+        arts = {_norm_title(it.get("artistName", "")) for it in cands}
+        if cands and len(arts) == 1:
+            return cands[0]["syncedLyrics"]
+        return None
+    except Exception as e:
+        logging.debug(f"_lrclib_by_title: {e}")
+    return None
 
 
 def _lrclib(url: str, expected_artist: Optional[str] = None) -> Optional[str]:
@@ -636,6 +714,32 @@ def _try_enhanced(query: str) -> Optional[str]:
     return None
 
 
+def _lrc_first_text(lrc: str) -> str:
+    """LRC에서 첫 실제 가사 텍스트 한 줄을 정규화해 추출(타임스탬프/단어태그 제거)."""
+    for line in (lrc or "").splitlines():
+        t = re.sub(r"\[[0-9:.]+\]", "", line)        # [00:12.34]
+        t = re.sub(r"<[0-9:.]+>", "", t)              # <00:12.34> 단어태그
+        t = re.sub(r"[^a-z0-9가-힣 ]", "", t.lower()).strip()
+        t = re.sub(r"\s+", " ", t)
+        if len(t) >= 4:
+            return t[:30]
+    return ""
+
+
+def _enhanced_is_right(synced: str, artist: str, track: str) -> bool:
+    """enhanced(단어별) 결과가 맞는 곡인지 lrclib 검증본의 첫 줄과 대조.
+    검증본이 없으면 일단 신뢰(기존 동작 유지). 첫 줄이 명백히 다르면 동명곡으로 보고 폐기."""
+    try:
+        ref = _lrclib("https://lrclib.net/api/search?" + urllib.parse.urlencode(
+            {"q": f"{track} {artist}"}), expected_artist=artist) or _lrclib_by_title(track, artist)
+    except Exception:
+        return True
+    a, b = _lrc_first_text(synced), _lrc_first_text(ref or "")
+    if not a or not b:
+        return True
+    return a[:12] == b[:12] or a in b or b in a
+
+
 def fetch_lrc(artist: str, track: str, album: str) -> Optional[str]:
     cache_key = re.sub(r"[^\w\-]", "_", f"{artist}_{track}")[:100]
     cache_file = os.path.join(CACHE_DIR, f"{cache_key}.lrc")
@@ -651,16 +755,28 @@ def fetch_lrc(artist: str, track: str, album: str) -> Optional[str]:
 
     logging.info(f"Fetching lyrics: {artist} - {track}")
     # 0) 단어별(enhanced) 가사 우선 — 진짜 박자 동기화. 단어 태그가 있을 때만 채택.
-    synced = _try_enhanced(f"{artist} {track}")
-    if synced:
-        logging.info(f"단어별(enhanced) 가사 사용: {artist} - {track}")
+    # 한글 아티스트는 영문명으로 먼저 검색(K-pop은 영문 메타가 정확 → 동명곡 오매칭 방지).
+    en_known = next((en for ko, en in ARTIST_EN.items() if ko in (artist or "")), None)
+    synced = None
+    if en_known and en_known.lower() not in (artist or "").lower():
+        synced = _try_enhanced(f"{en_known} {track}")
+        if synced:
+            logging.info(f"단어별(enhanced·영문명) 가사 사용: {en_known} - {track}")
     if not synced:
-        # 한글 아티스트면 lrclib에서 영어명 얻어 단어별 재검색 (뉴진스→NewJeans). 곡명은 원래 것 유지.
+        synced = _try_enhanced(f"{artist} {track}")
+        if synced:
+            logging.info(f"단어별(enhanced) 가사 사용: {artist} - {track}")
+    if not synced:
+        # 매핑에 없는 한글 아티스트는 lrclib에서 영어명 동적 조회 후 재검색 (뉴진스→NewJeans).
         en_a = _lrclib_en_artist(track, artist)
         if en_a and en_a.lower() not in artist.lower():
             synced = _try_enhanced(f"{en_a} {track}")
             if synced:
                 logging.info(f"단어별(영어명) 가사 사용: {en_a} - {track}")
+    # enhanced는 아티스트 메타가 없어 동명곡을 잘못 집을 수 있음 → 검증본과 대조해 틀리면 폐기.
+    if synced and not _enhanced_is_right(synced, artist, track):
+        logging.info(f"enhanced 결과 검증 실패(동명 다른 곡 의심) → 폐기: {artist} - {track}")
+        synced = None
     if not synced:
         synced = _lrclib("https://lrclib.net/api/get?" + urllib.parse.urlencode(
             {"artist_name": artist, "track_name": track, "album_name": album}))
@@ -682,7 +798,30 @@ def fetch_lrc(artist: str, track: str, album: str) -> Optional[str]:
         except Exception as e:
             logging.debug(f"syncedlyrics: {e}")
 
-    if synced:
+    # 받긴 했지만 타임스탬프 줄이 하나도 없으면(엉뚱/비동기 결과) 폐기하고 폴백 계속.
+    if synced and not parse_lyrics(synced):
+        synced = None
+
+    # 제목에 (feat. …)/(with …)/[…] 등 괄호 꼬리표가 붙어 매칭 실패하는 경우가 많음.
+    # 꼬리표를 떼고 깨끗한 제목으로 한 번 더 시도 (예: '에잇 (feat. SUGA)' → '에잇').
+    track_clean = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]\s*$", "", track).strip()
+    if not synced and track_clean and track_clean != track:
+        logging.info(f"꼬리표 제거 후 재시도: '{track}' → '{track_clean}'")
+        synced = _try_enhanced(f"{artist} {track_clean}")
+        if not synced:
+            synced = _lrclib("https://lrclib.net/api/get?" + urllib.parse.urlencode(
+                {"artist_name": artist, "track_name": track_clean}))
+        if not synced:
+            synced = _lrclib("https://lrclib.net/api/search?" + urllib.parse.urlencode(
+                {"q": f"{track_clean} {artist}"}), expected_artist=artist)
+
+    # 마지막 구제: 제목으로만 검색해 제목 일치하는 가사 채택(한↔영 아티스트명 불일치 대응)
+    if not synced:
+        synced = _lrclib_by_title(track_clean or track, artist)
+        if synced:
+            logging.info(f"제목 매칭으로 가사 채택: {artist} - {track_clean or track}")
+
+    if synced and parse_lyrics(synced):   # 타임스탬프 줄이 실제로 있을 때만 채택/캐싱
         with open(cache_file, "w", encoding="utf-8") as f:
             f.write(synced)
         logging.info(f"Cached: {artist} - {track}")
@@ -736,6 +875,39 @@ _load_lock = threading.Lock()
 _loaded = {"token": None, "lrc_lines": [], "use_karaoke": True, "has_thumb": False}
 
 
+def write_lines_json(token: str, artist: str, track: str, lines):
+    """화면 가사창용으로 전체 가사 줄을 JSON으로 내보냄 (곡 바뀔 때 1회).
+    lines = [(ts, text, words_or_None)] → {"t":ts,"text":text,"words":[[wts,w],..] or null}."""
+    try:
+        payload = {
+            "track_id": token,
+            "title": track,
+            "artist": artist,
+            "color": _current_color,
+            "lines": [
+                {"t": ts, "text": text,
+                 "words": ([[wts, w] for wts, w in words] if words else None)}
+                for ts, text, words in lines
+            ],
+        }
+        tmp = LINES_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, LINES_FILE)   # 원자적 교체(창이 반쪽짜리 파일을 읽지 않게)
+    except Exception as e:
+        logging.debug(f"write_lines_json: {e}")
+
+
+def write_pos(pos: float, playing: bool, token, dur: float = 0.0):
+    """현재 재생 위치 비콘 (창이 로컬 시계로 보간).
+    'pos|playing|sampled_unix|duration|track_id' (track_id엔 '|||'가 있어 맨 뒤에 둠)."""
+    try:
+        with open(POS_FILE, "w", encoding="utf-8") as f:
+            f.write(f"{pos:.3f}|{1 if playing else 0}|{time.time():.3f}|{dur:.3f}|{token or ''}")
+    except Exception as e:
+        logging.debug(f"write_pos: {e}")
+
+
 def load_track_assets(token: str, artist: str, track: str, album: str, genre: str):
     """느린 작업(가사 fetch + 색 추출 + 썸네일)을 백그라운드에서 수행 후 _loaded에 기록."""
     global _current_color
@@ -746,6 +918,7 @@ def load_track_assets(token: str, artist: str, track: str, album: str, genre: st
         _current_color = get_album_color()        # _current_rgb / _glow_color도 갱신
         thumb = generate_album_thumb(_current_rgb)
         generate_firework_frames(_current_rgb)    # 탭 불꽃 프레임(앨범색)
+        write_lines_json(token, artist, track, lines)  # 화면 가사창에 전체 가사 공급
         with _load_lock:
             _loaded.update(token=token, lrc_lines=lines,
                            use_karaoke=karaoke, has_thumb=thumb)
@@ -771,6 +944,10 @@ def main():
     # 느린 osascript 위치 읽기는 RESYNC_INTERVAL마다 한 번만.
     # 그 사이는 내부 단조시계(monotonic)로 위치를 보간해 부드럽게 추적.
     RESYNC_INTERVAL = 1.0
+    # BTT push(osascript)는 이 간격으로 합쳐서 호출 폭주를 막음(발열↓).
+    # 가사 글자가 빨리 바뀌어도 이 주기로만 push → 최신값을 1번에 묶어 보냄.
+    PUSH_MIN_INTERVAL = 0.15
+    last_push_mono = -999.0  # 마지막으로 BTT push한 monotonic 시각
     state = None
     base_pos = 0.0          # 마지막으로 읽은 실제 재생 위치
     base_mono = 0.0         # 그 위치를 읽기 직전의 monotonic 시각
@@ -785,6 +962,7 @@ def main():
     loaded_token = None     # 백그라운드 로딩 결과가 적용된 곡 토큰
     scrubber_mode = False   # 더블탭 토글: 가사 대신 스크러버만 표시
     last_tap_mtime = 0.0    # 마지막으로 본 탭 파일 시각(더블탭 감지용)
+    last_pos_write = 0.0    # 화면 가사창용 위치 비콘 마지막 기록 시각
 
     while True:
         now = time.monotonic()
@@ -805,6 +983,7 @@ def main():
                 miss_count += 1
                 if miss_count >= 3 and state is not None:
                     write_files("")
+                    write_pos(0.0, False, None, 0.0)   # 가사창에 '정지' 알림
                     state = None
                     current_track_id = None
                     lrc_lines = []
@@ -848,6 +1027,11 @@ def main():
 
         # --- 보간된 현재 위치 (재생 중일 때만 시간 흐름 반영) ---
         est_pos = base_pos + ((time.monotonic() - base_mono) if playing else 0.0)
+
+        # 화면 가사창용 위치 비콘(~0.2초마다). LEAD 없는 원위치 → 창이 자체 보간.
+        if now - last_pos_write >= 0.2:
+            write_pos(est_pos, playing, current_track_id, state.get("duration", 0.0))
+            last_pos_write = now
 
         title_artist = truncate(f"{state['track']} - {state['artist']}", 80)
         pos_lead = est_pos + LEAD_SECONDS
@@ -900,11 +1084,15 @@ def main():
         else:
             icon_path = NOTE_FRAMES[0]
 
-        # 텍스트/아이콘이 바뀌면(또는 버스트 진입/이탈 시) 갱신
-        if text != last_text or icon_path != last_icon or tap_burst != last_burst:
+        # 텍스트/아이콘이 바뀌면(또는 버스트 진입/이탈 시) 갱신.
+        # 단, BTT push는 PUSH_MIN_INTERVAL로 합쳐 호출 폭주를 막음. 간격이 안 찼으면
+        # 이번 변경은 push하지 않고 보류 → 다음 자격 루프에서 '최신값'으로 한 번에 나감.
+        changed = (text != last_text or icon_path != last_icon or tap_burst != last_burst)
+        if changed and (now - last_push_mono) >= PUSH_MIN_INTERVAL:
             last_text = text
             last_icon = icon_path
             last_burst = tap_burst
+            last_push_mono = now
             # 폴백 스크립트(폴링)도 같은 아이콘을 보도록 NOTE_ICON 동기화
             try:
                 with open(icon_path, "rb") as src, open(NOTE_ICON, "wb") as dst:
@@ -913,7 +1101,7 @@ def main():
                 pass
             write_files(text, icon_path)
 
-        time.sleep(0.05)
+        time.sleep(0.10)
 
 
 if __name__ == "__main__":
